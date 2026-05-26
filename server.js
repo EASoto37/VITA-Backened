@@ -19,7 +19,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// ── ANTHROPIC CHAT (with optional web search) ──
+// ── ANTHROPIC CHAT ──
 app.post('/api/chat', async (req, res) => {
   try {
     const fetch = (await import('node-fetch')).default;
@@ -46,7 +46,6 @@ app.post('/api/speak', async (req, res) => {
     const fetch = (await import('node-fetch')).default;
     const { text } = req.body;
     const voiceId = process.env.ELEVENLABS_VOICE_ID || '4BAlflaQyhIcCfHiEI7x';
-    
     const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
       method: 'POST',
       headers: {
@@ -55,17 +54,15 @@ app.post('/api/speak', async (req, res) => {
         'Accept': 'audio/mpeg'
       },
       body: JSON.stringify({
-        text: text,
+        text,
         model_id: 'eleven_monolingual_v1',
         voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0.3, use_speaker_boost: true }
       })
     });
-
     if (!response.ok) {
       const err = await response.text();
       return res.status(response.status).json({ error: err });
     }
-
     const buffer = await response.buffer();
     res.set('Content-Type', 'audio/mpeg');
     res.send(buffer);
@@ -79,28 +76,21 @@ app.post('/api/speak', async (req, res) => {
 app.post('/api/send-email', async (req, res) => {
   try {
     const { to, subject, body } = req.body;
-
     if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
       return res.status(500).json({ error: 'Gmail credentials not configured' });
     }
-
     const transporter = nodemailer.createTransport({
       host: 'smtp.gmail.com',
       port: 465,
       secure: true,
-      auth: {
-        user: process.env.GMAIL_USER,
-        pass: process.env.GMAIL_APP_PASSWORD
-      }
+      auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASSWORD }
     });
-
     await transporter.sendMail({
       from: `"Edward Soto | Vita Capital" <${process.env.GMAIL_USER}>`,
       to, subject,
       text: body,
       html: body.replace(/\n/g, '<br>')
     });
-
     res.json({ success: true });
   } catch (err) {
     console.error('Email error:', err.message);
@@ -108,13 +98,38 @@ app.post('/api/send-email', async (req, res) => {
   }
 });
 
-// ── MORNING BRIEFING ──
+// ── MORNING BRIEFING — Real property search ──
 app.get('/api/briefing', async (req, res) => {
   try {
     const fetch = (await import('node-fetch')).default;
-    
-    // Search for new DFW properties
-    const searchResponse = await fetch('https://api.anthropic.com/v1/messages', {
+    const searches = [
+      'quadplex for sale Dallas Fort Worth Texas site:loopnet.com OR site:zillow.com',
+      'multifamily apartment complex for sale DFW Texas 2025',
+      '4 plex fourplex for sale Dallas TX under 800000',
+      'multifamily for sale Fort Worth TX value add',
+      'RV park for sale Texas 2025',
+      'self storage facility for sale Texas',
+      'car wash for sale DFW Texas'
+    ];
+
+    const searchPrompt = `You are a real estate market intelligence system. Search the web RIGHT NOW for active investment property listings.
+
+Run searches for these queries:
+${searches.map((s,i) => `${i+1}. "${s}"`).join('\n')}
+
+For EACH real listing you find, provide:
+- Full property address (street, city, state, zip)
+- Property type
+- Asking price (exact dollar amount)
+- Number of units or size
+- Cap rate if listed
+- Days on market if available  
+- Direct URL to listing on LoopNet, Zillow, Crexi, or Realtor.com
+- Listing broker/agent name if shown
+
+Format as numbered list. Include ONLY real listings with real addresses and real prices you actually found. Minimum 8 properties. Include the clickable URL for each.`;
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -123,31 +138,24 @@ app.get('/api/briefing', async (req, res) => {
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-5',
-        max_tokens: 2000,
-        system: 'You are VITA, a real estate market intelligence engine. Search for active investment property listings in DFW.',
+        max_tokens: 3000,
+        system: 'You are VITA market intelligence. Search for real active investment property listings with real addresses, prices, and URLs. Never make up listings.',
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-        messages: [{
-          role: 'user',
-          content: `Search for active real estate investment listings in Dallas-Fort Worth matching these criteria:
-- Quadplexes under $800,000
-- Small multifamily 5-20 units, value-add
-- RV parks in Texas
-- Self-storage facilities in Texas  
-- Car washes in Texas
-- Retail strip centers DFW under $3M
-
-For each property found provide: name, address, price, units/size, cap rate if available, and direct URL.
-Return as a numbered list with REAL listings and REAL URLs.`
-        }]
+        messages: [{ role: 'user', content: searchPrompt }]
       })
     });
 
-    const searchData = await searchResponse.json();
+    const data = await response.json();
     let properties = '';
-    if (searchData.content) {
-      for (const block of searchData.content) {
+    if (data.content) {
+      for (const block of data.content) {
         if (block.type === 'text') properties += block.text;
       }
+    }
+
+    if (data.error) {
+      console.error('Briefing search error:', data.error);
+      return res.status(500).json({ error: JSON.stringify(data.error) });
     }
 
     res.json({
