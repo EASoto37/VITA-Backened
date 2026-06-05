@@ -238,10 +238,20 @@ async function streamToString(stream){
   return Buffer.concat(chunks).toString('utf8');
 }
 
+// Query params:
+//   filter=unread (default)     — only UNSEEN, last 20
+//   filter=all                  — every message in INBOX, last 50 (read + unread)
+//   filter=from&sender=<query>  — IMAP FROM-header search, last 50
+// Response shape is unchanged: { count, emails, inboxTotal, filter }.
 app.get('/api/emails', async (req, res) => {
-  console.log('[VITA emails] ── /api/emails START ──');
+  const filter = String(req.query.filter || 'unread').toLowerCase();
+  const sender = String(req.query.sender || '').trim();
+  console.log('[VITA emails] ── /api/emails START ── filter=' + filter + (sender ? ' sender=' + sender : ''));
   console.log('[VITA emails] GMAIL_USER:', process.env.GMAIL_USER ? `SET (${process.env.GMAIL_USER})` : 'NOT SET');
   console.log('[VITA emails] GMAIL_APP_PASSWORD:', process.env.GMAIL_APP_PASSWORD ? `SET (len=${process.env.GMAIL_APP_PASSWORD.length})` : 'NOT SET');
+  if(filter === 'from' && !sender){
+    return res.status(400).json({ error: 'filter=from requires sender query parameter', count: 0, emails: [] });
+  }
   try {
     if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
       console.error('[VITA emails] Missing credentials — aborting');
@@ -280,12 +290,42 @@ app.get('/api/emails', async (req, res) => {
     try {
       mailboxInfo = client.mailbox;
       console.log('[VITA emails] INBOX opened — total messages:', mailboxInfo && mailboxInfo.exists);
-      const unseen = await client.search({ seen: false }, { uid: true }) || [];
-      console.log('[VITA emails] UNSEEN UIDs returned by server:', unseen.length, '(first 5:', unseen.slice(0, 5).join(','), ')');
-      const order = unseen.slice().reverse().slice(0, 20);
+
+      // Pick UID set based on filter. Each branch yields a `pickedUids` array
+      // already capped to the right size, then we fall through to one shared
+      // fetch + body-download loop.
+      let pickedUids = [];
+      let cap = 20;
+      if(filter === 'all'){
+        cap = 50;
+        const total = (mailboxInfo && mailboxInfo.exists) || 0;
+        if(total > 0){
+          // Sequence numbers are 1..exists; newest is `exists`. Fetch the last
+          // `cap` sequence numbers, collect their UIDs, then sort newest-first.
+          const start = Math.max(1, total - cap + 1);
+          const range = start + ':' + total;
+          const uids = [];
+          for await (const m of client.fetch(range, { uid: true })) uids.push(m.uid);
+          pickedUids = uids.sort((a,b)=>b-a).slice(0, cap);
+        }
+        console.log('[VITA emails] ALL: picked', pickedUids.length, 'UIDs (cap=' + cap + ')');
+      } else if(filter === 'from'){
+        cap = 50;
+        // imapflow's FROM search matches the From header (substring, case-insensitive).
+        const hits = await client.search({ from: sender }, { uid: true }) || [];
+        pickedUids = hits.slice().sort((a,b)=>b-a).slice(0, cap);
+        console.log('[VITA emails] FROM "' + sender + '": ' + hits.length + ' hits → picked ' + pickedUids.length);
+      } else {
+        // default: unread
+        const unseen = await client.search({ seen: false }, { uid: true }) || [];
+        console.log('[VITA emails] UNSEEN UIDs returned by server:', unseen.length, '(first 5:', unseen.slice(0, 5).join(','), ')');
+        pickedUids = unseen.slice().reverse().slice(0, cap);
+      }
+
+      const order = pickedUids;
       console.log('[VITA emails] Will fetch envelope+bodyStructure for', order.length, 'message(s)');
       if (order.length) {
-        for await (const msg of client.fetch(order, { envelope: true, bodyStructure: true }, { uid: true })) {
+        for await (const msg of client.fetch(order, { envelope: true, bodyStructure: true, flags: true }, { uid: true })) {
           const env = msg.envelope || {};
           const f = (env.from && env.from[0]) ? env.from[0] : {};
           const parts = { textPart: null, htmlPart: null, attachments: [] };
@@ -308,6 +348,15 @@ app.get('/api/emails', async (req, res) => {
           }
           if(body.length > 5000) body = body.slice(0, 5000) + '\n…[truncated]';
 
+          // flags is a Set in imapflow; \\Seen indicates read.
+          let unread = true;
+          try {
+            if(msg.flags){
+              if(typeof msg.flags.has === 'function') unread = !msg.flags.has('\\Seen');
+              else if(Array.isArray(msg.flags)) unread = !msg.flags.includes('\\Seen');
+            }
+          } catch(e){}
+
           emails.push({
             uid: msg.uid,
             subject: env.subject || '(no subject)',
@@ -315,17 +364,24 @@ app.get('/api/emails', async (req, res) => {
             fromAddress: f.address || '',
             date: env.date || null,
             body: body.trim(),
-            attachments: parts.attachments
+            attachments: parts.attachments,
+            unread
           });
         }
       }
+      // Newest-first across all branches (envelope dates can drift from UID order).
+      emails.sort((a,b)=>{
+        const da = a.date ? new Date(a.date).getTime() : 0;
+        const db = b.date ? new Date(b.date).getTime() : 0;
+        return db - da;
+      });
       console.log('[VITA emails] Fetch complete — assembled', emails.length, 'records');
     } finally {
       lock.release();
     }
     await client.logout();
     console.log('[VITA emails] Logged out. Returning count=', emails.length);
-    res.json({ count: emails.length, emails, inboxTotal: mailboxInfo ? mailboxInfo.exists : null });
+    res.json({ count: emails.length, emails, inboxTotal: mailboxInfo ? mailboxInfo.exists : null, filter, sender: filter === 'from' ? sender : undefined });
   } catch (err) {
     console.error('[VITA emails] IMAP error:', err && err.message, err && err.stack);
     res.status(500).json({ error: err.message, count: 0, emails: [] });
