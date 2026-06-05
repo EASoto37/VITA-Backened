@@ -12,7 +12,8 @@
     "nodemailer": "^6.9.7",
     "node-fetch": "^3.3.2",
     "imapflow": "^1.0.164",
-    "pg": "^8.11.3"
+    "pg": "^8.11.3",
+    "pdf-parse": "^1.1.1"
   },
   "engines": {
     "node": ">=18.0.0"

@@ -173,11 +173,71 @@ app.post('/api/send-email', async (req, res) => {
   }
 });
 
-// ── GMAIL INBOX — ALL unread messages (subject + sender) ──
+// ── GMAIL INBOX — ALL unread messages (subject + sender + body + attachments) ──
 // Reads the inbox over IMAP using the same Gmail App Password used for sending.
 // Requires `imapflow` in package.json and IMAP enabled on the Gmail account.
 // Degrades gracefully (returns an empty list + error) if either is missing so
 // the rest of the backend keeps working.
+//
+// Walks bodyStructure to (a) pull the first text/plain (fallback: text/html
+// stripped to text) body and (b) collect attachment metadata
+// {partId, filename, size, contentType}. The attachment bytes themselves are
+// NOT downloaded here — the frontend asks for them via /api/email/attachment
+// when the user actually opens one. Caps body at ~5000 chars to keep payloads
+// reasonable.
+
+// bodyStructure is a tree of parts. Walk it depth-first and collect:
+//   - first text/plain part (textPart)
+//   - first text/html part (htmlPart) as fallback
+//   - all parts whose disposition is 'attachment' or that have a filename
+function walkBodyStructure(node, out){
+  if(!node) return;
+  if(Array.isArray(node.childNodes) && node.childNodes.length){
+    for(const c of node.childNodes) walkBodyStructure(c, out);
+    return;
+  }
+  const type = (node.type || '').toLowerCase();
+  const disp = (node.disposition || '').toLowerCase();
+  const params = node.dispositionParameters || {};
+  const tparams = node.parameters || {};
+  const filename = params.filename || tparams.name || null;
+  if(disp === 'attachment' || (filename && type !== 'text/plain' && type !== 'text/html')){
+    out.attachments.push({
+      partId: node.part || '1',
+      filename: filename || ('attachment.' + (type.split('/')[1] || 'bin')),
+      size: node.size || 0,
+      contentType: type
+    });
+  } else if(type === 'text/plain' && !out.textPart){
+    out.textPart = node.part || '1';
+  } else if(type === 'text/html' && !out.htmlPart){
+    out.htmlPart = node.part || '1';
+  }
+}
+
+function stripHtml(html){
+  return String(html || '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+async function streamToString(stream){
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  return Buffer.concat(chunks).toString('utf8');
+}
+
 app.get('/api/emails', async (req, res) => {
   console.log('[VITA emails] ── /api/emails START ──');
   console.log('[VITA emails] GMAIL_USER:', process.env.GMAIL_USER ? `SET (${process.env.GMAIL_USER})` : 'NOT SET');
@@ -220,25 +280,46 @@ app.get('/api/emails', async (req, res) => {
     try {
       mailboxInfo = client.mailbox;
       console.log('[VITA emails] INBOX opened — total messages:', mailboxInfo && mailboxInfo.exists);
-      // SEARCH UNSEEN — all unread messages in INBOX.
       const unseen = await client.search({ seen: false }, { uid: true }) || [];
       console.log('[VITA emails] UNSEEN UIDs returned by server:', unseen.length, '(first 5:', unseen.slice(0, 5).join(','), ')');
-      // Newest first, then keep only the last 20.
       const order = unseen.slice().reverse().slice(0, 20);
-      console.log('[VITA emails] Will fetch envelope for', order.length, 'message(s)');
+      console.log('[VITA emails] Will fetch envelope+bodyStructure for', order.length, 'message(s)');
       if (order.length) {
-        for await (const msg of client.fetch(order, { envelope: true }, { uid: true })) {
+        for await (const msg of client.fetch(order, { envelope: true, bodyStructure: true }, { uid: true })) {
           const env = msg.envelope || {};
           const f = (env.from && env.from[0]) ? env.from[0] : {};
+          const parts = { textPart: null, htmlPart: null, attachments: [] };
+          if(msg.bodyStructure) walkBodyStructure(msg.bodyStructure, parts);
+
+          // Download the body part. Prefer text/plain; fall back to stripped HTML.
+          // Mark unread-preserving (peek) so the message stays UNSEEN after fetch.
+          let body = '';
+          const pick = parts.textPart || parts.htmlPart;
+          if(pick){
+            try {
+              const dl = await client.download(msg.uid, pick, { uid: true });
+              if(dl && dl.content){
+                const raw = await streamToString(dl.content);
+                body = parts.textPart ? raw : stripHtml(raw);
+              }
+            } catch(dlErr){
+              console.warn('[VITA emails] body download failed for uid', msg.uid, dlErr.message);
+            }
+          }
+          if(body.length > 5000) body = body.slice(0, 5000) + '\n…[truncated]';
+
           emails.push({
+            uid: msg.uid,
             subject: env.subject || '(no subject)',
             from: f.name || f.address || 'Unknown',
             fromAddress: f.address || '',
-            date: env.date || null
+            date: env.date || null,
+            body: body.trim(),
+            attachments: parts.attachments
           });
         }
       }
-      console.log('[VITA emails] Envelope fetch complete — assembled', emails.length, 'records');
+      console.log('[VITA emails] Fetch complete — assembled', emails.length, 'records');
     } finally {
       lock.release();
     }
@@ -248,6 +329,91 @@ app.get('/api/emails', async (req, res) => {
   } catch (err) {
     console.error('[VITA emails] IMAP error:', err && err.message, err && err.stack);
     res.status(500).json({ error: err.message, count: 0, emails: [] });
+  }
+});
+
+// ── PARSE ARBITRARY UPLOADED PDF ──
+// POST /api/parse-pdf { base64, filename } → { text, pages, filename }
+// Used by the ARIA Deal Analysis drop zone: the browser reads a dropped PDF
+// as base64 via FileReader and posts it here so pdf-parse can extract text
+// (pdf-parse runs in Node, not the browser). Caps body at 25MB.
+app.post('/api/parse-pdf', async (req, res) => {
+  try {
+    const { base64, filename } = req.body || {};
+    if(!base64) return res.status(400).json({ error: 'base64 required' });
+    let buf;
+    try { buf = Buffer.from(base64, 'base64'); }
+    catch(e){ return res.status(400).json({ error: 'invalid base64' }); }
+    if(buf.length > 25 * 1024 * 1024) return res.status(413).json({ error: 'PDF too large (max 25MB)' });
+    let pdfParse;
+    try { pdfParse = require('pdf-parse'); }
+    catch(e){ return res.status(501).json({ error: 'pdf-parse not installed — run `npm install pdf-parse` and redeploy' }); }
+    const parsed = await pdfParse(buf);
+    res.json({ filename: filename || 'document.pdf', text: parsed.text || '', pages: parsed.numpages || 0, size: buf.length });
+  } catch (err) {
+    console.error('[VITA parse-pdf] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── EMAIL ATTACHMENT DOWNLOAD + PDF TEXT EXTRACTION ──
+// POST /api/email/attachment { uid, partId }
+// Connects to IMAP, downloads the specified MIME part, and if it's a PDF runs
+// pdf-parse to extract text. Returns { filename, contentType, size, text, base64 }.
+// For non-PDFs we return base64 so the frontend can offer it as a download.
+app.post('/api/email/attachment', async (req, res) => {
+  try {
+    const { uid, partId } = req.body || {};
+    if(!uid || !partId) return res.status(400).json({ error: 'uid and partId required' });
+    if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
+      return res.status(500).json({ error: 'Gmail credentials not configured' });
+    }
+    let ImapFlow;
+    try { ({ ImapFlow } = await import('imapflow')); }
+    catch(e){ return res.status(501).json({ error: 'imapflow not installed' }); }
+
+    const client = new ImapFlow({
+      host: 'imap.gmail.com', port: 993, secure: true,
+      auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASSWORD },
+      logger: false
+    });
+    await client.connect();
+    const lock = await client.getMailboxLock('INBOX');
+    let payload = null, meta = null;
+    try {
+      const dl = await client.download(Number(uid), String(partId), { uid: true });
+      if(!dl || !dl.content) throw new Error('attachment part not found');
+      meta = dl.meta || {};
+      const chunks = [];
+      for await (const c of dl.content) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
+      payload = Buffer.concat(chunks);
+    } finally { lock.release(); }
+    await client.logout();
+
+    const filename = (meta && (meta.filename || meta.name)) || ('attachment-' + uid + '-' + partId);
+    const contentType = (meta && meta.contentType) || 'application/octet-stream';
+    const isPdf = /pdf/i.test(contentType) || /\.pdf$/i.test(filename);
+
+    let text = '';
+    if(isPdf){
+      try {
+        const pdfParse = require('pdf-parse');
+        const parsed = await pdfParse(payload);
+        text = parsed.text || '';
+      } catch(pdfErr){
+        console.error('[VITA attachment] pdf-parse failed:', pdfErr.message);
+        return res.status(500).json({ error: 'pdf-parse failed: ' + pdfErr.message + ' (run `npm install pdf-parse` and redeploy)', filename, contentType, size: payload.length });
+      }
+    }
+
+    res.json({
+      filename, contentType, size: payload.length,
+      text,
+      base64: isPdf ? null : payload.toString('base64')
+    });
+  } catch (err) {
+    console.error('[VITA attachment] error:', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -487,22 +653,25 @@ async function novaInboxScan(){
       const unseen = await client.search({ seen: false }, { uid: true }) || [];
       const order = unseen.slice().reverse().slice(0, 20);
       if(order.length){
-        for await (const msg of client.fetch(order, { envelope: true }, { uid: true })){
+        for await (const msg of client.fetch(order, { envelope: true, bodyStructure: true }, { uid: true })){
           const env = msg.envelope || {};
           const f = (env.from && env.from[0]) ? env.from[0] : {};
           const subject = env.subject || '(no subject)';
-          // Importance heuristic: anything that smells like a lender, broker
-          // reply, contract, LOI, offer, or wire-transfer instruction.
+          const parts = { textPart: null, htmlPart: null, attachments: [] };
+          if(msg.bodyStructure) walkBodyStructure(msg.bodyStructure, parts);
+          // Importance heuristic: subject/sender OR an attached PDF/doc (likely
+          // contract, OM, T12, rent roll).
           const lc = (subject + ' ' + (f.address||'')).toLowerCase();
-          const important = /loi|offer|contract|wire|closing|lender|appraisal|earnest|broker|due diligence|signed|approved|funded/.test(lc);
-          flagged.push({ subject, from: f.name || f.address || 'Unknown', date: env.date || null, important });
+          const hasDocAttachment = parts.attachments.some(a => /pdf|word|excel|sheet|document/i.test(a.contentType || '') || /\.(pdf|docx?|xlsx?)$/i.test(a.filename || ''));
+          const important = hasDocAttachment || /loi|offer|contract|wire|closing|lender|appraisal|earnest|broker|due diligence|signed|approved|funded/.test(lc);
+          flagged.push({ subject, from: f.name || f.address || 'Unknown', date: env.date || null, important, attachmentCount: parts.attachments.length });
         }
       }
     } finally { lock.release(); }
     await client.logout();
     const importantCount = flagged.filter(e => e.important).length;
     const summary = `[Inbox scan ${new Date().toISOString()}] ${flagged.length} unread, ${importantCount} flagged important.\n` +
-      flagged.slice(0, 10).map(e => `${e.important ? '⚑ ' : '  '}${e.from} — ${e.subject}`).join('\n');
+      flagged.slice(0, 10).map(e => `${e.important ? '⚑ ' : '  '}${e.from} — ${e.subject}${e.attachmentCount ? ' [' + e.attachmentCount + ' attachment' + (e.attachmentCount===1?'':'s') + ']' : ''}`).join('\n');
     await appendAgentMessage('NOVA', summary);
   }catch(err){
     console.error('[VITA sched] NOVA scan failed:', err.message);
