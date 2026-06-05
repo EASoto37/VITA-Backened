@@ -246,11 +246,15 @@ async function streamToString(stream){
 app.get('/api/emails', async (req, res) => {
   const filter = String(req.query.filter || 'unread').toLowerCase();
   const sender = String(req.query.sender || '').trim();
-  console.log('[VITA emails] ── /api/emails START ── filter=' + filter + (sender ? ' sender=' + sender : ''));
+  const query  = String(req.query.query  || '').trim();
+  console.log('[VITA emails] ── /api/emails START ── filter=' + filter + (sender ? ' sender=' + sender : '') + (query ? ' query="' + query + '"' : ''));
   console.log('[VITA emails] GMAIL_USER:', process.env.GMAIL_USER ? `SET (${process.env.GMAIL_USER})` : 'NOT SET');
   console.log('[VITA emails] GMAIL_APP_PASSWORD:', process.env.GMAIL_APP_PASSWORD ? `SET (len=${process.env.GMAIL_APP_PASSWORD.length})` : 'NOT SET');
   if(filter === 'from' && !sender){
     return res.status(400).json({ error: 'filter=from requires sender query parameter', count: 0, emails: [] });
+  }
+  if(filter === 'keyword' && !query){
+    return res.status(400).json({ error: 'filter=keyword requires query parameter', count: 0, emails: [] });
   }
   try {
     if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
@@ -315,6 +319,21 @@ app.get('/api/emails', async (req, res) => {
         const hits = await client.search({ from: sender }, { uid: true }) || [];
         pickedUids = hits.slice().sort((a,b)=>b-a).slice(0, cap);
         console.log('[VITA emails] FROM "' + sender + '": ' + hits.length + ' hits → picked ' + pickedUids.length);
+      } else if(filter === 'keyword'){
+        // req 5: full-inbox keyword search across subject + body. IMAP exposes
+        // both SUBJECT and BODY search predicates server-side (Gmail supports
+        // them natively). We union the two UID sets so a hit in either field
+        // qualifies, then take the most-recent `cap`.
+        cap = 50;
+        let subjHits = [];
+        let bodyHits = [];
+        try { subjHits = await client.search({ subject: query }, { uid: true }) || []; }
+        catch(e){ console.warn('[VITA emails] SUBJECT search failed:', e.message); }
+        try { bodyHits = await client.search({ body:    query }, { uid: true }) || []; }
+        catch(e){ console.warn('[VITA emails] BODY search failed:', e.message); }
+        const merged = Array.from(new Set([...(subjHits||[]), ...(bodyHits||[])]));
+        pickedUids = merged.sort((a,b)=>b-a).slice(0, cap);
+        console.log('[VITA emails] KEYWORD "' + query + '": subj=' + subjHits.length + ' body=' + bodyHits.length + ' merged=' + merged.length + ' → picked ' + pickedUids.length);
       } else {
         // default: unread
         const unseen = await client.search({ seen: false }, { uid: true }) || [];
@@ -381,7 +400,7 @@ app.get('/api/emails', async (req, res) => {
     }
     await client.logout();
     console.log('[VITA emails] Logged out. Returning count=', emails.length);
-    res.json({ count: emails.length, emails, inboxTotal: mailboxInfo ? mailboxInfo.exists : null, filter, sender: filter === 'from' ? sender : undefined });
+    res.json({ count: emails.length, emails, inboxTotal: mailboxInfo ? mailboxInfo.exists : null, filter, sender: filter === 'from' ? sender : undefined, query: filter === 'keyword' ? query : undefined });
   } catch (err) {
     console.error('[VITA emails] IMAP error:', err && err.message, err && err.stack);
     res.status(500).json({ error: err.message, count: 0, emails: [] });
