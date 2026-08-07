@@ -3,6 +3,14 @@ const cors = require('cors');
 const nodemailer = require('nodemailer');
 const { Pool } = require('pg');
 
+// ── VITA CONFIG ──
+// Single source of truth for the current org/user. Referenced by the migration
+// and seed logic below instead of hardcoding these strings inline.
+const VITA_CONFIG = {
+  organization_id: 'vita_capital',
+  user_id: 'edward_soto'
+};
+
 const app = express();
 app.use(cors());
 app.use(express.json({limit: '10mb'}));
@@ -23,10 +31,109 @@ async function initDb(){
     await pool.query(`CREATE TABLE IF NOT EXISTS vita_pipeline (id SERIAL PRIMARY KEY, data JSONB, updated_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS vita_properties (id SERIAL PRIMARY KEY, data JSONB, updated_at TIMESTAMP DEFAULT NOW())`);
     console.log('[VITA db] tables ready');
+    await migrateDb();
   }catch(err){
     console.error('[VITA db] init failed:', err.message);
   }
 }
+
+// ── ORG/MULTI-TENANT MIGRATION ──────────────────────────────────────────────
+// Runs on every boot. Every statement is idempotent (CREATE TABLE IF NOT EXISTS,
+// ADD COLUMN IF NOT EXISTS, INSERT … ON CONFLICT DO NOTHING) so re-running does
+// nothing after the first successful pass. All changes are ADDITIVE — no drops,
+// no updates to existing rows — so the pre/post row counts must match exactly.
+const MIGRATE_TABLES = ['agent_memory', 'vita_contacts', 'vita_pipeline', 'vita_properties'];
+
+async function migrateDb(){
+  if(!pool) return;
+
+  // ── STEP 1: BACKUP — snapshot every table + row count BEFORE touching schema.
+  const before = {};
+  try{
+    console.log('[VITA migrate] ── STEP 1: BACKUP (pre-migration snapshot) ──');
+    for(const t of MIGRATE_TABLES){
+      const { rows } = await pool.query(`SELECT * FROM ${t}`);
+      before[t] = rows.length;
+      console.log(`[VITA migrate] ${t}: ${rows.length} row(s)`);
+      console.log(`[VITA migrate] ${t} data:`, JSON.stringify(rows));
+    }
+  }catch(err){
+    console.error('[VITA migrate] BACKUP FAILED — aborting migration, no schema changed:', err.message);
+    return;
+  }
+
+  try{
+    // ── STEP 2: ORGANIZATION STRUCTURE ──
+    await pool.query(`CREATE TABLE IF NOT EXISTS organizations (
+      id VARCHAR(50) PRIMARY KEY,
+      name VARCHAR(100) NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    )`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS vita_users (
+      id VARCHAR(50) PRIMARY KEY,
+      organization_id VARCHAR(50) REFERENCES organizations(id),
+      name VARCHAR(100),
+      email VARCHAR(100),
+      role VARCHAR(50) DEFAULT 'owner',
+      created_at TIMESTAMP DEFAULT NOW()
+    )`);
+    await pool.query(
+      `INSERT INTO organizations (id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [VITA_CONFIG.organization_id, 'Vita Capital LLC']
+    );
+    await pool.query(
+      `INSERT INTO vita_users (id, organization_id, name, email, role)
+       VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING`,
+      [VITA_CONFIG.user_id, VITA_CONFIG.organization_id, 'Edward Soto', 'edward.soto@vitacapitaltx.com', 'owner']
+    );
+    console.log('[VITA migrate] STEP 2 ✓ organizations + vita_users ready and seeded');
+
+    // ── STEP 3: ADD organization_id + user_id TO ALL EXISTING TABLES ──
+    for(const t of MIGRATE_TABLES){
+      await pool.query(`ALTER TABLE ${t}
+        ADD COLUMN IF NOT EXISTS organization_id VARCHAR(50) DEFAULT '${VITA_CONFIG.organization_id}',
+        ADD COLUMN IF NOT EXISTS user_id VARCHAR(50) DEFAULT '${VITA_CONFIG.user_id}'`);
+    }
+    console.log('[VITA migrate] STEP 3 ✓ organization_id + user_id added to', MIGRATE_TABLES.join(', '));
+
+    // ── STEP 4: AI RUNS TABLE ──
+    await pool.query(`CREATE TABLE IF NOT EXISTS ai_runs (
+      id SERIAL PRIMARY KEY,
+      organization_id VARCHAR(50) DEFAULT '${VITA_CONFIG.organization_id}',
+      user_id VARCHAR(50) DEFAULT '${VITA_CONFIG.user_id}',
+      agent_name VARCHAR(20),
+      model VARCHAR(50),
+      input_tokens INT,
+      output_tokens INT,
+      status VARCHAR(20),
+      entity_type VARCHAR(50),
+      created_at TIMESTAMP DEFAULT NOW()
+    )`);
+    console.log('[VITA migrate] STEP 4 ✓ ai_runs table ready');
+  }catch(err){
+    console.error('[VITA migrate] MIGRATION FAILED:', err.message);
+    return;
+  }
+
+  // ── VERIFY: post-migration row counts must equal the pre-migration snapshot.
+  try{
+    console.log('[VITA migrate] ── VERIFY: post-migration row counts ──');
+    let allMatch = true;
+    for(const t of MIGRATE_TABLES){
+      const { rows } = await pool.query(`SELECT COUNT(*)::int AS c FROM ${t}`);
+      const after = rows[0].c;
+      const match = after === before[t];
+      if(!match) allMatch = false;
+      console.log(`[VITA migrate] ${t}: before=${before[t]} after=${after} ${match ? '✓ OK' : '✗ MISMATCH'}`);
+    }
+    console.log(allMatch
+      ? '[VITA migrate] ✓✓ All row counts match — no data lost. Migration complete.'
+      : '[VITA migrate] ✗✗ ROW COUNT MISMATCH — investigate immediately, data may have been affected.');
+  }catch(err){
+    console.error('[VITA migrate] verification query failed:', err.message);
+  }
+}
+
 initDb();
 
 const DATA_TABLES = { contacts: 'vita_contacts', pipeline: 'vita_pipeline', properties: 'vita_properties' };
@@ -791,6 +898,19 @@ if(pool){
 } else {
   console.warn('[VITA sched] no DATABASE_URL — scheduled agents disabled');
 }
+
+// ── CENTRAL ERROR HANDLER ──
+// Express recognizes middleware with 4 args (err, req, res, next) as the error
+// handler. Must be registered AFTER all routes. Catches anything thrown in a
+// sync handler or passed via next(err); the existing async routes still catch
+// their own errors, so this is a last-resort safety net.
+app.use((err, req, res, next) => {
+  console.error('[VITA ERROR]', err.message, err.stack);
+  res.status(err.status || 500).json({
+    success: false,
+    error: err.message || 'Internal server error'
+  });
+});
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
